@@ -26,7 +26,7 @@ import sys
 import threading
 import time
 
-from flask import Flask, Response, jsonify, render_template_string
+from flask import Flask, Response, jsonify, request
 
 try:
     from flask_sock import Sock
@@ -133,7 +133,8 @@ class Hand:
 
 # ---------------- 状态 ----------------
 LOCK = threading.Lock()
-STATE = {"t": 0.0, "ratios": {}, "frames": 0, "active": False, "msg": ""}
+STATE = {"t": 0.0, "ratios": {}, "frames": 0, "active": False, "msg": "",
+         "hb_t": 0.0, "ev": "", "err": "", "targets": None}
 RETARGET = Retargeter()
 HAND = None
 
@@ -143,10 +144,56 @@ sock = Sock(app) if Sock else None
 PAGE = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "xr.html"),
             encoding="utf-8").read()
 
+FIST = [3925, 3688, 3800, 3451, 3569, 3800, 3406, 4000, 3800, 4500, 4300, 2000, 2044]
+
 
 @app.route("/xr")
 def xr_page():
-    return Response(PAGE, mimetype="text/html; charset=utf-8")
+    resp = Response(PAGE, mimetype="text/html; charset=utf-8")
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return resp
+
+
+def handle_payload(raw):
+    """WebSocket 与 HTTP POST 共用。"""
+    d = json.loads(raw) if isinstance(raw, str) else raw
+    with LOCK:
+        STATE["hb_t"] = time.time()
+        STATE["frames"] += 1
+        if d.get("ev"):
+            STATE["ev"] = str(d["ev"])[:40]
+        if d.get("err"):
+            STATE["err"] = str(d["err"])[:200]
+    grip = d.get("grip")
+    if grip is not None:
+        g = max(0.0, min(1.0, float(grip)))
+        tgt = [int(round(g * FIST[i])) for i in range(13)]
+        with LOCK:
+            STATE["t"] = time.time()
+            STATE["targets"] = tgt
+        if HAND and HAND.enabled:
+            HAND.send(tgt)
+        return
+    joints = d.get("hand")
+    if not joints or len(joints) != 25:
+        return
+    tgt, ratios = RETARGET.update(joints)
+    with LOCK:
+        STATE["t"] = time.time()
+        STATE["targets"] = tgt
+        STATE["ratios"] = {k: round(v, 3) for k, v in ratios.items()}
+    if HAND and HAND.enabled:
+        HAND.send(tgt)
+
+
+@app.route("/api/xr_frame", methods=["POST"])
+def api_xr_frame():
+    """HTTP 后备：wss 被自签证书挡住时用。"""
+    try:
+        handle_payload(request.get_data(as_text=True))
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
 
 
 @app.route("/")
@@ -160,7 +207,9 @@ def index():
 def status():
     with LOCK:
         s = dict(STATE)
-    s["age"] = round(time.time() - STATE["t"], 2) if STATE["t"] else None
+    now = time.time()
+    s["age"] = round(now - STATE["t"], 2) if STATE["t"] else None
+    s["hb_age"] = round(now - STATE["hb_t"], 2) if STATE["hb_t"] else None
     s["enabled"] = bool(HAND and HAND.enabled)
     return jsonify(s)
 
@@ -189,17 +238,7 @@ if sock:
             if msg is None:
                 break
             try:
-                d = json.loads(msg)
-                joints = d.get("hand")
-                if not joints or len(joints) != 25:
-                    continue
-                tgt, ratios = RETARGET.update(joints)
-                with LOCK:
-                    STATE["t"] = time.time()
-                    STATE["ratios"] = {k: round(v, 3) for k, v in ratios.items()}
-                    STATE["frames"] += 1
-                if HAND and HAND.enabled:
-                    HAND.send(tgt)
+                handle_payload(msg)
             except Exception:
                 continue
 

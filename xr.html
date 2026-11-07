@@ -10,27 +10,28 @@
   #hud { position:fixed; left:0; top:0; right:0; padding:14px 18px; z-index:10;
          background:linear-gradient(#0b0d12ee,#0b0d1200); pointer-events:none; }
   #hud h1 { font-size:16px; margin:0 0 6px; font-weight:600; }
-  #stat { font-size:12px; line-height:1.7; color:#8b93a7; }
-  #stat b { color:#e6e8ee; }
-  .ok { color:#31c48d !important; } .bad { color:#f05252 !important; }
+  #stat { font-size:12px; line-height:1.75; color:#8b93a7; }
+  #stat b { color:#e6e8ee; } .ok{color:#31c48d!important} .bad{color:#f05252!important}
   #start { position:fixed; left:50%; top:50%; transform:translate(-50%,-50%);
-           padding:16px 28px; font-size:17px; border-radius:12px; border:0;
+           padding:16px 30px; font-size:17px; border-radius:12px; border:0;
            background:#1f6feb; color:#fff; font-weight:600; z-index:20; }
-  #start:disabled { opacity:.5; }
-  canvas { display:block; }
-  #tip { position:fixed; bottom:18px; left:0; right:0; text-align:center;
+  #cv2d { position:fixed; inset:0; width:100%; height:100%; }
+  #tip { position:fixed; bottom:16px; left:0; right:0; text-align:center;
          font-size:12px; color:#6b7280; z-index:10; }
 </style>
 </head>
 <body>
 <div id="hud">
   <h1>HandPlay · VR 手部追踪</h1>
-  <div id="stat">等待进入 VR…</div>
+  <div id="stat">等待进入 VR… <span style="color:#ffd166" id="build"></span></div>
 </div>
 <button id="start">进入 VR</button>
-<div id="tip">需要先在 PICO 设置里开启「手部追踪」</div>
-<canvas id="cv"></canvas>
+<div id="tip">PICO 需在「交互」里选「手柄手势自动切换」</div>
+<canvas id="cv2d"></canvas>
 <script>
+const BUILD = 'v1107-1825';
+document.getElementById('build').textContent = 'build ' + BUILD;
+
 const JOINTS = [
   "wrist",
   "thumb-metacarpal","thumb-phalanx-proximal","thumb-phalanx-distal","thumb-tip",
@@ -43,31 +44,61 @@ const BONES = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[8,9],
                [0,10],[10,11],[11,12],[12,13],[13,14],[0,15],[15,16],[16,17],[17,18],[18,19],
                [0,20],[20,21],[21,22],[22,23],[23,24]];
 
-const cv = document.getElementById('cv');
-const ctx = cv.getContext('2d');
 const stat = document.getElementById('stat');
-const btn = document.getElementById('start');
+const btn  = document.getElementById('start');
+const cv2d = document.getElementById('cv2d');
+const ctx  = cv2d.getContext('2d');
 
-let ws = null, sending = 0, fps = 0, tPrev = 0;
-let lastPts = null;
-
-function resize(){ cv.width = innerWidth * devicePixelRatio; cv.height = innerHeight * devicePixelRatio;
+function resize(){ cv2d.width = innerWidth*devicePixelRatio|0; cv2d.height = innerHeight*devicePixelRatio|0;
                    ctx.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0); }
 addEventListener('resize', resize); resize();
 
-function connectWS(){
-  const url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws/xr';
-  ws = new WebSocket(url);
-  ws.onopen = () => { stat.innerHTML += '<div class="ok">WebSocket 已连接</div>'; };
-  ws.onclose = () => { stat.innerHTML += '<div class="bad">WebSocket 断开</div>'; };
-  ws.onerror = () => { stat.innerHTML += '<div class="bad">WebSocket 错误</div>'; };
+/* ---------- 上报 ---------- */
+function post(obj){
+  const body = JSON.stringify(Object.assign({t: Date.now(), hb: 1, v: BUILD}, obj));
+  fetch('/api/xr_frame', {method:'POST', headers:{'Content-Type':'application/json'}, body})
+    .catch(()=>{});
+}
+function ev(name, extra){ post(Object.assign({ev: name}, extra||{})); }
+setInterval(()=>post({}), 1000);
+ev('loaded');
+
+window.onerror = (m, s, l, c, e) => { ev('js-error', {err: (m+' @'+l+':'+c+' '+(e&&e.stack||'')).slice(0,300)}); };
+window.addEventListener('unhandledrejection', e => {
+  ev('js-error', {err: String(e.reason && (e.reason.stack||e.reason.message) || e.reason).slice(0,300)});
+});
+
+/* ---------- WebSocket（失败自动走 POST） ---------- */
+let ws = null;
+try {
+  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws/xr');
+  ws.onopen  = () => ev('ws-open');
+  ws.onclose = () => ev('ws-close');
+  ws.onerror = () => ev('ws-error');
+} catch(e) { ev('ws-throw', {err:String(e)}); }
+
+/* ---------- 渲染层：没有它 PICO 会一直转圈 ---------- */
+let gl = null, refSpace = null;
+function initGL(session){
+  const c = document.createElement('canvas');
+  gl = c.getContext('webgl', {xrCompatible: true, alpha: false, antialias: false,
+                              depth: false, stencil: false, powerPreference: 'high-performance'});
+  if(!gl){ ev('no-webgl'); throw new Error('WebGL 不可用'); }
+  const setLayer = () => session.updateRenderState({ baseLayer: new XRWebGLLayer(session, gl) });
+  if(gl.makeXRCompatible){ return gl.makeXRCompatible().then(setLayer, e => {
+      ev('xr-compat-failed', {err:String(e)}); setLayer(); }); }
+  setLayer();
+  return Promise.resolve();
 }
 
-function draw(pts){
-  ctx.clearRect(0,0,cv.width,cv.height);
+/* ---------- 状态 ---------- */
+let lastPts = null, sending = 0, fps = 0, tPrev = 0;
+let session = null;
+
+function draw2d(pts){
+  ctx.clearRect(0,0,cv2d.width,cv2d.height);
   if(!pts) return;
-  // 极简投影：用 x,y，z 忽略
-  const cx = innerWidth/2, cy = innerHeight/2, S = innerWidth * 1.6;
+  const cx = innerWidth/2, cy = innerHeight/2, S = innerWidth*1.5;
   const P = pts.map(p => [cx + p[0]*S, cy - p[1]*S]);
   ctx.strokeStyle = '#31c48d'; ctx.lineWidth = 2;
   for(const [a,b] of BONES){
@@ -78,65 +109,101 @@ function draw(pts){
 }
 
 async function enter(){
-  if(!navigator.xr){ alert('这个浏览器不支持 WebXR'); return; }
-  // PICO / Quest 对 ar 与 vr 的支持不同，两个都试
-  let session = null, lastErr = null;
-  for(const m of ['immersive-ar', 'immersive-vr']){
+  if(!navigator.xr){ ev('no-xr'); alert('浏览器不支持 WebXR'); return; }
+  let lastErr = null;
+  const withTimeout = (p, ms) => Promise.race([p, new Promise((_,rej)=>setTimeout(()=>rej(new Error('timeout')), ms))]);
+
+  // 1) vr + 手部可选（最稳，PICO 上先跑通这个）
+  // 2) ar + 手部可选
+  // 3) vr + 手部必选
+  const plans = [
+    { mode:'immersive-vr', tag:'vr+hand?', opts:{ optionalFeatures:['hand-tracking','local-floor'] } },
+    { mode:'immersive-ar', tag:'ar+hand?', opts:{ optionalFeatures:['hand-tracking','local-floor'] } },
+    { mode:'immersive-vr', tag:'vr+hand!', opts:{ requiredFeatures:['hand-tracking'], optionalFeatures:['local-floor'] } },
+  ];
+  for(const p of plans){
     try{
-      if(!(await navigator.xr.isSessionSupported(m))) continue;
-      session = await navigator.xr.requestSession(m, {
-        requiredFeatures: ['hand-tracking'],
-        optionalFeatures: ['local-floor']
-      });
+      ev('trying', {tag:p.tag});
+      const sup = await navigator.xr.isSessionSupported(p.mode);
+      if(!sup){ ev('unsupported', {tag:p.tag}); continue; }
+      session = await withTimeout(navigator.xr.requestSession(p.mode, p.opts), 9000);
+      ev('session-started', {tag:p.tag});
       break;
-    }catch(e){ lastErr = e; }
+    }catch(e){ lastErr = e; ev('attempt-failed', {tag:p.tag, err:String(e && e.message || e)}); }
   }
-  if(!session){ alert('无法进入 VR 会话（可能没开启手部追踪）：' + (lastErr ? lastErr.message : '')); return; }
+  if(!session){ ev('all-failed', {err:String(lastErr && lastErr.message || '')});
+                alert('无法进入 VR：' + (lastErr ? lastErr.message : '未知')); return; }
+
+  try { await initGL(session); ev('layer-ready'); }
+  catch(e){ ev('layer-failed', {err:String(e && e.message || e)}); }
+
   btn.style.display = 'none';
-  session.addEventListener('end', () => { btn.style.display = 'block'; stat.innerHTML += '<div>会话结束</div>'; });
-  const refSpace = await session.requestReferenceSpace('local');
+  refSpace = await session.requestReferenceSpace('local');
+  session.addEventListener('end', () => { btn.style.display='block'; ev('session-end'); });
+  session.requestAnimationFrame(onFrame);
+}
+
+function onFrame(t, frame){
   session.requestAnimationFrame(onFrame);
 
-  function onFrame(t, frame){
-    session.requestAnimationFrame(onFrame);
-    let pts = null;
-    const srcs = session.inputSources;
-    let nSrc = srcs ? srcs.length : 0, nHand = 0;
-    for(const src of (srcs || [])){
-      if(src.hand) nHand++;
+  /* 关键：每帧必须往 XR 帧缓冲提交，否则 PICO 一直显示"进入中" */
+  const layer = session.renderState.baseLayer;
+  if(layer && gl){
+    gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
+    gl.clearColor(0.04, 0.05, 0.08, 1.0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.flush();
+  }
+
+  const srcs = session.inputSources || [];
+  let nHand = 0, pts = null, grip = null;
+  for(const s of srcs){ if(s.hand) nHand++; }
+
+  for(const s of srcs){
+    if(!s.hand) continue;
+    const tmp = [];
+    let okAll = true;
+    for(const name of JOINTS){
+      const joint = s.hand.get(name);
+      const pose = joint && frame.getJointPose(joint, refSpace);
+      if(!pose){ okAll = false; break; }
+      tmp.push([pose.transform.position.x, pose.transform.position.y, pose.transform.position.z]);
     }
-    for(const src of (srcs || [])){
-      if(!src.hand) continue;
-      pts = [];
-      for(const name of JOINTS){
-        const joint = src.hand.get(name);
-        const pose = joint && frame.getJointPose(joint, refSpace);
-        if(!pose){ pts = null; break; }
-        pts.push([pose.transform.position.x, pose.transform.position.y, pose.transform.position.z]);
-      }
-      if(pts) break;
+    if(okAll){ pts = tmp; break; }
+  }
+
+  if(!pts){
+    for(const s of srcs){
+      const gp = s.gamepad; if(!gp) continue;
+      const b = gp.buttons && gp.buttons[0];
+      grip = b ? (b.value !== undefined ? b.value : (b.pressed ? 1 : 0)) : 0;
+      break;
     }
-    if(pts){
-      lastPts = pts;
-      if(ws && ws.readyState === 1){
-        ws.send(JSON.stringify({ t: Date.now(), hand: pts }));
-        sending++;
-      }
-    }
-    draw(lastPts);
-    if(t - tPrev > 500){
-      fps = (fps*0.5 + (sending*1000/(t-tPrev))*0.5) || 0;
-      sending = 0; tPrev = t;
-      const handTxt = nHand > 0 ? '<b class="ok">已追踪</b>' : '<b class="bad">未追踪</b>';
-      stat.innerHTML = '<div>手：' + handTxt + '</div>' +
-                       '<div>输入源：<b>' + nSrc + '</b> 个，含手部数据 <b>' + nHand + '</b> 个</div>' +
-                       '<div>发送：<b>' + fps.toFixed(0) + '</b> Hz</div>' +
-                       '<div>WebSocket：<b>' + (ws && ws.readyState===1 ? '已连接' : '未连接') + '</b></div>';
-    }
+  }
+
+  if(pts || grip !== null){
+    const payload = pts ? {t:Date.now(), hand:pts} : {t:Date.now(), grip:grip};
+    if(ws && ws.readyState === 1){ ws.send(JSON.stringify(payload)); }
+    else { post(payload); }
+    sending++;
+  }
+
+  lastPts = pts;
+  draw2d(lastPts);
+
+  if(t - tPrev > 500){
+    fps = (fps*0.5 + (sending*1000/(t-tPrev))*0.5) || 0;
+    sending = 0; tPrev = t;
+    const handTxt = nHand > 0 ? '<b class="ok">已追踪</b>' : '<b class="bad">未追踪</b>';
+    stat.innerHTML = '<div>手：'+handTxt+'</div>' +
+      '<div>输入源：<b>'+srcs.length+'</b> 个，含手部 <b>'+nHand+'</b> 个</div>' +
+      '<div>发送：<b>'+fps.toFixed(0)+'</b> Hz</div>' +
+      '<div>渲染层：<b>'+(gl?'已建立':'无')+'</b>　WS：<b>'+(ws&&ws.readyState===1?'连上':'未连')+'</b></div>' +
+      '<div style="color:#ffd166">build '+BUILD+'</div>';
   }
 }
 
-btn.onclick = () => { connectWS(); enter().catch(e => { alert('进入失败：' + e.message); console.error(e); }); };
+btn.onclick = () => { ev('clicked'); enter().catch(e => { ev('enter-failed', {err:String(e && e.message || e)}); alert('失败：'+e.message); }); };
 </script>
 </body>
 </html>
