@@ -1,61 +1,68 @@
 # PICOFinger
 
-用 **PICO / Quest 头显的手部追踪**，实时遥操作一只**灵巧手**。
+Drive a **dexterous hand** in real time with the hand tracking of a **PICO / Quest** headset.
 
-整套链路只有一个网页：头显打开浏览器就能用，不装 APK、不用 Unity、不需要 ROS，也不依赖任何厂商 SDK。
-仓库里带一个可直接运行的参考实现（PaXini DexH13），换成别的灵巧手只需要替换一个驱动层。
+Everything happens in one web page: open it in the headset browser and go. No APK, no Unity,
+no ROS, no vendor SDK required.
+The repository ships a ready-to-run reference implementation (PaXini DexH13); supporting a
+different hand only means replacing the driver layer.
 
 ---
 
-## 原理
+## How it works
 
 ```
-PICO / Quest 浏览器
-  └─ WebXR XRHand：25 个手部关节（3D 坐标，60–72 Hz）
+PICO / Quest browser
+  └─ WebXR XRHand: 25 hand joints (3D, 60-72 Hz)
        └─ WebSocket / HTTP POST
-            └─ 本仓库服务
-                 ├─ 25 关节 → 每根手指屈曲度（关节夹角之和）
-                 ├─ 自动标定区间 → 归一化 0~1
-                 └─ × 目标姿态的电机量 → N 个关节目标
-                      └─ 串口 / CAN / UDP → 灵巧手
+            └─ this server
+                 ├─ 25 joints -> per-finger flexion (sum of joint angles)
+                 ├─ auto-calibration -> normalised 0..1
+                 └─ x target pose -> N joint targets
+                      └─ serial / CAN / UDP -> dexterous hand
 ```
 
-**为什么用 WebXR**：头显自带手部追踪，浏览器直接通过 `XRHand` 暴露关节，省掉装应用、打包、签名整套流程。改一行代码刷新页面就生效。
+**Why WebXR**: the headset already tracks hands and the browser exposes the joints through
+`XRHand`, so there is no app to build, sign or install. Edit a line, reload the page, done.
 
-**为什么比摄像头好**：给的是真 3D 坐标，不受透视和光照影响；帧率更高，不丢帧。
+**Why it beats a camera**: the joints are true 3D, unaffected by perspective or lighting, at a
+higher frame rate and without dropping frames.
 
-**没有手部追踪时**：自动回退到**手柄扳机**控制——扳机值 0~1 映射到全部手指，先让链路跑通。
+**When there is no hand tracking**: the page falls back to the **controller trigger**, mapped
+0..1 onto all fingers, so the link can be verified before the tracking is sorted out.
 
 ---
 
-## 硬件要求
+## Requirements
 
-| 部件 | 要求 |
+| Part | Requirement |
 |---|---|
-| 头显 | 支持 WebXR Hand Tracking 的机型（PICO 4 / 4 Ultra、Quest 2/3 等） |
-| 服务器 | 任意 Linux / Windows / macOS，能跑 Python 3.10+，与头显同一局域网 |
-| 灵巧手 | 任意可编程灵巧手；仓库自带 PaXini DexH13（RS485 Modbus RTU）的参考驱动 |
+| Headset | any model with WebXR Hand Tracking (PICO 4 / 4 Ultra, Quest 2/3, ...) |
+| Server | any Linux / Windows / macOS box with Python 3.10+, on the same LAN as the headset |
+| Hand | any programmable dexterous hand; a PaXini DexH13 driver (RS485 Modbus RTU) ships here |
 
-> 不同灵巧手的自由度、通信方式和使能时序差异很大，**适配方法见下文「接到你自己的灵巧手」**。
+> Degrees of freedom, transports and enable sequences differ wildly between hands.
+> Adapting one is described in "Bring your own hand" below.
 
 ---
 
-## 快速开始
+## Quick start
 
 ```bash
 pip install flask flask-sock pyserial
 
-export DEXH13_PORT=/dev/ttyUSB0        # 换成你的串口
-python3 xr_server.py                   # 默认 http://0.0.0.0:8000
+export DEXH13_PORT=/dev/ttyUSB0        # your serial device
+python3 xr_server.py                   # http://0.0.0.0:8000
 ```
 
-**WebXR 要求安全上下文**：网页必须是 HTTPS 或 `localhost`，普通局域网 http 地址不行。所以实际使用时带证书：
+**WebXR insists on a secure context**: the page has to be served over HTTPS or from
+`localhost`. A plain LAN http address will not work, so run it with a certificate:
 
 ```bash
 mkdir -p certs
 openssl req -x509 -newkey rsa:2048 -nodes \
   -keyout certs/key.pem -out certs/cert.pem -days 3650 \
-  -subj "/CN=<服务器IP>"
+  -subj "/CN=<server-ip>"
 
 export DEXH13_SSL_CERT=certs/cert.pem
 export DEXH13_SSL_KEY=certs/key.pem
@@ -63,123 +70,136 @@ export DEXH13_WEB_PORT=8443
 python3 xr_server.py                   # https://0.0.0.0:8443
 ```
 
-自签名证书浏览器会警告，点「高级 → 继续前往」即可（安全上下文仍然成立）。
+The browser will complain about the self-signed certificate; accept it ("Advanced -> Proceed").
+The context is still secure.
 
 ---
 
-## 头显操作
+## On the headset
 
-1. **打开手部追踪**
-   - PICO：设置 → 交互 → 选「**手柄手势自动切换**」（选「仅手柄」时手部输入源根本不会出现）
-   - Quest：设置 → 动作追踪 → 开启「手部追踪」
-2. 头显与服务器连**同一个局域网**
-3. 浏览器打开 `https://<服务器IP>:8443/xr`
-4. 接受证书警告
-5. 点页面中间的「**进入 VR**」
-6. 手举到胸前，开始控制
+1. **Turn hand tracking on**
+   - PICO: Settings -> Interaction -> **"controllers and hands switch automatically"**
+     (with "controllers only" the hand input source never appears)
+   - Quest: Settings -> Movement tracking -> enable **Hand tracking**
+2. Put the headset and the server on the **same LAN**
+3. Open `https://<server-ip>:8443/xr` in the headset browser
+4. Accept the certificate warning
+5. Press **Enter VR** in the middle of the page
+6. Raise your hand in front of you and start controlling
 
-### 页面显示什么
+### What the page shows
 
 ```
-手：已追踪 / 未追踪
-输入源：N 个，含手部数据 M 个
-发送：XX Hz
-渲染层：已建立
+Hand: tracked / not tracked
+Inputs: N sources, M with hand data
+Sending: XX Hz
+Render layer: ready
 ```
 
-- `含手部 0 个` → 系统还是手柄模式，按上面第 1 步切换
-- `未追踪` → 手不在头显视野内
-- `发送 0 Hz` → 数据没发出去，看下一节
+- `0 inputs with hand data` -> the system is still in controller mode; see step 1
+- `not tracked` -> the hand is outside the headset's field of view
+- `0 Hz` -> nothing is being sent, see the next section
 
-进 VR 后网页的 DOM 默认不显示（所以上面这些字在头显里看不到），页面会每秒发一次心跳，服务器端 `/api/status` 能看到 `hb_age`、`age`、`ev`、`err`，用于排错。
+The page DOM is not visible inside an immersive session, so the page also sends a heartbeat
+once a second; the server exposes `hb_age`, `age`, `ev` and `err` on `/api/status` for
+troubleshooting.
 
 ---
 
-## 接口
+## Endpoints
 
-| 路径 | 说明 |
+| Path | Purpose |
 |---|---|
-| `/xr` | 头显页面（WebXR + WebSocket） |
-| `/ws/xr` | WebSocket 通道 |
-| `/api/xr_frame` | 同上的 HTTP POST 后备（证书挡住 wss 时用） |
-| `/api/status` | 链路状态、帧数、错误 |
-| `/api/start` / `/api/stop` | 使能 / 失能灵巧手 |
+| `/xr` | headset page (WebXR + WebSocket) |
+| `/ws/xr` | WebSocket channel |
+| `/api/xr_frame` | the same over HTTP POST (used when the certificate blocks wss) |
+| `/api/status` | link state, frame counters, last error |
+| `/api/start` / `/api/stop` | enable / disable the hand |
 
-关节顺序遵循 WebXR 规范：`wrist`、`thumb-metacarpal`、`thumb-phalanx-proximal`、…、`pinky-finger-tip`，共 25 个。
+Joint order follows the WebXR spec: `wrist`, `thumb-metacarpal`, `thumb-phalanx-proximal`, ...,
+`pinky-finger-tip`, 25 joints in total.
 
 ---
 
-## 接到你自己的灵巧手
+## Bring your own hand
 
-`xr_server.py` 里只有 `Hand` 这一类跟具体硬件相关，其余都是通用的：
+Only the `Hand` class in `xr_server.py` is hardware specific; everything else is generic:
 
 ```python
 class Hand:
-    def open(self):    ...   # 打开通信（串口 / CAN / UDP）
-    def enable(self):  ...   # 上电使能（很多手需要特定的时序）
-    def disable(self): ...   # 失能
-    def send(self, targets): ...   # 下发 N 个关节目标
-    def version(self): ...   # 读取固件版本，仅用于日志
+    def open(self):    ...   # open the transport (serial / CAN / UDP)
+    def enable(self):  ...   # power on (many hands need a fixed sequence)
+    def disable(self): ...   # power off
+    def send(self, targets): ...   # push N joint targets
+    def version(self): ...   # firmware version, only used for logging
 ```
 
-替换步骤：
+To adapt it:
 
-1. 把 `Retargeter` 输出的**归一化比值**（0~1，按手指）映射成你手上的**关节目标单位**（角度 / 编码器值 / 电流）。
-   参考实现里 `FIST = [...]` 就是「握拳」时 13 个电机的目标值，比值直接乘上去。
-2. 关掉 `protocol.py`（Modbus）换成你的通信实现。
-3. 自由度不同也没关系：`MOTOR_FINGER` 描述「第 i 个关节属于哪根手指」，按你的手改这张表即可。没有小指、没有腕部自由度的手（例如 4 指 13 自由度）会自动忽略多余关节。
+1. Map the **normalised ratios** (0..1 per finger) coming out of `Retargeter` onto your hand's
+   joint units (degrees / encoder counts / current). In the reference implementation `FIST`
+   holds the 13 motor targets for "make a fist"; the ratio simply scales them.
+2. Drop `protocol.py` (Modbus) and plug in your own transport.
+3. Different DoF counts are fine: `MOTOR_FINGER` says which finger joint *i* belongs to.
+   Hands without a pinky or without a wrist (a 4-finger, 13-DoF hand, for instance) simply
+   ignore the extra joints.
 
 ---
 
-## 常见问题
+## Troubleshooting
 
-**进 VR 后一直转圈（PICO 的白色加载圈）**
+**Endless spinner after pressing Enter VR (PICO)**
 
-WebXR 要求**每帧向 XR 帧缓冲提交一帧**，否则系统会一直等。页面必须：
+WebXR only composes a frame if the page submits one. The page must:
 
-1. 用 `new XRWebGLLayer(session, gl)` 设置 `baseLayer`
-2. 每帧 `gl.bindFramebuffer(...)` + `gl.clear(...)` + `gl.flush()`
+1. set `baseLayer` with `new XRWebGLLayer(session, gl)`
+2. bind the framebuffer, clear it and flush **every** frame
 
-另外 `requestAnimationFrame` 的回调里引用的 `session` 必须是**模块级变量**，否则第一帧就抛 `ReferenceError`，表现同样是永远转圈。这两点都已在本仓库实现。
+Also, the `session` referenced inside the `requestAnimationFrame` callback has to be a
+module-scope variable; otherwise the first frame throws a `ReferenceError` and the spinner
+stays forever. Both are handled here.
 
-**拿不到手部数据**
+**No hand data**
 
-- 头显交互方式是「仅手柄」→ 手部输入源不会出现
-- 头显不在手部追踪的视野内
-- 部分系统版本的 `hand-tracking` 只能作**可选特性**（`optionalFeatures`），放 `requiredFeatures` 会挂起
+- interaction mode is "controllers only" -> the hand input source never appears
+- the hand is outside the tracking volume
+- some OS versions only accept `hand-tracking` as an **optional** feature; putting it in
+  `requiredFeatures` makes the session request hang
 
-**WebSocket 连不上（页面 https，wss 被自签证书挡住）**
+**WebSocket refuses to connect (page on https, wss blocked by the self-signed cert)**
 
-浏览器的证书例外通常只覆盖 `https://`，不覆盖 `wss://`。页面会自动降级为 `POST /api/xr_frame`，也可用 USB 方式彻底绕开：
+Browsers usually scope the certificate exception to `https://` and not to `wss://`. The page
+falls back to `POST /api/xr_frame` on its own, and a USB cable removes the problem entirely:
 
 ```bash
 adb reverse tcp:8443 tcp:8443
-# 头显打开 http://localhost:8443/xr
+# open http://localhost:8443/xr in the headset
 ```
 
-**手在动但很僵硬或抖动**
+**Stiff or jittery motion**
 
-- 前几秒多做几次张手 / 握拳，让自动标定学到区间
-- 调 `Retargeter(alpha=)`，越小越平滑
-- 单帧限速在 `update()` 里（默认 400 单位/帧）
-
----
-
-## 已知限制
-
-- 只有关节姿态，没有手部网格和触觉反馈；捏合、握拳等语义要自己算
-- 手出视野时关节姿态返回 `null`，需自行处理保持/回零策略
-- 不同头显系统版本对 `hand-tracking` 的支持程度不同，务必做运行时特性检测，不要靠 User-Agent 判断
+- spend a few seconds opening and closing the hand so the auto-calibration learns the range
+- lower `Retargeter(alpha=)` for smoother output
+- the per-frame rate limit lives in `update()` (400 units per frame by default)
 
 ---
 
-## 实测环境
+## Known limitations
 
-| 项 | 值 |
+- joint poses only: no hand mesh, no haptics; pinch and fist have to be derived
+- joints return `null` when the hand leaves the field of view; pick a hold or return-to-zero policy
+- `hand-tracking` support varies between headset OS versions, so always detect at runtime
+  instead of sniffing the user agent
+
+---
+
+## Tested with
+
+| Item | Value |
 |---|---|
-| 头显 | PICO 4 Ultra（WebXR，浏览器内） |
-| 灵巧手 | PaXini DexH13（4 指 13 自由度，RS485 Modbus RTU 460800，右手从站 0x79） |
-| 服务器 | Ubuntu 22.04，Python 3.10 |
+| Headset | PICO 4 Ultra (browser, WebXR) |
+| Hand | PaXini DexH13 (4 fingers, 13 DoF, RS485 Modbus RTU at 460800 or 4 Mbaud, right hand `0x79`) |
+| Server | Ubuntu 22.04, Python 3.10 |
 
 ---
 
